@@ -1430,21 +1430,6 @@ enum it87_isabridge_type {
 
 /* ==== BEGIN: Global H2RAM / ISA-bridge MMIO manager and hybrid accessors ==== */
 
-/* Helpers for Intel type bridges */
-static inline void it87_hidden_cleanup(struct pci_dev *pch_f0,
-									   struct pci_dev *pch_f1,
-									   bool e1_changed)
-{
-	if (pch_f1 && e1_changed) {
-		pci_write_config_byte(pch_f1, 0xE1, 0xFF);
-		msleep(1);
-	}
-	if (pch_f1)
-		pci_dev_put(pch_f1);
-	if (pch_f0)
-		pci_dev_put(pch_f0);
-}
-
 /* checks for compatible skylake bridges */
 static bool cpu_is_skl_kbl_cfl_family(void)
 {
@@ -1476,11 +1461,12 @@ static bool cpu_is_skl_kbl_cfl_family(void)
  * into 'h'. For generic Intel (no hidden window), marks hidden_ready=false. */
 static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 {
-	struct pci_dev *pch_f0 = NULL, *pch_f1 = NULL;
+	struct pci_bus *bus;
+	unsigned int pch_f1 = PCI_DEVFN(0x1f, 1);
 	u32 bar0 = 0;
 	u8 e1 = 0;
 	bool e1_changed = false;
-	int ret;
+	int ret = 0;
 	u32 hidden_ofs = 0;
 	u8 platform = 0;
 	int siv_ret;
@@ -1490,7 +1476,11 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 
 	h->hidden_ready = false;
 
-	/* Decide Intel ISA bridge kind and hidden offset */
+	/*
+	 * Select the PCR port ID used by this PCH generation.  Platform IDs
+	 * 4 and 6 use the newer DMI port; earlier client generations use the
+	 * Skylake-family DMI port.  Other Intel bridges need no PCR mirror.
+	 */
 	siv_ret = gbw_siv_platform_id(&platform);
 	if (siv_ret == 0 && (platform == 4 || platform == 6)) {
 		h->intel_isabridge_type = IT87_ISA_INTEL_Z390;
@@ -1504,50 +1494,68 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 		h->hidden_ready = false;
 		return 0;
 	}
-	/* Compute/capture hidden base using chosen hidden_ofs */
-	pch_f0 = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0x1f, 0));
-	if (!pch_f0)
-		return -ENODEV;
 
-	pch_f1 = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0x1f, 1));
-	if (!pch_f1) {
-		/* If hidden function is not present, allow Z390 fallback base */
-		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
-			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
-			h->hidden_ready = true;
-			it87_hidden_cleanup(pch_f0, NULL, false);
-			return 0;
-		}
-		it87_hidden_cleanup(pch_f0, NULL, false);
-		return -ENODEV;
-		}
+	/*
+	 * Address P2SB through the root bus config-space operations.  P2SB is
+	 * normally hidden before PCI enumeration, so looking it up as a normal
+	 * pci_dev would fail even though its configuration space still responds.
+	 */
+	bus = pci_find_bus(0, 0);
+	if (!bus)
+		goto fallback;
 
-	ret = pci_read_config_byte(pch_f1, 0xE1, &e1);
-	if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, false); return ret; }
+	/* Save the function-hide control so visibility can be restored exactly. */
+	ret = pci_bus_read_config_byte(bus, pch_f1, 0xE1, &e1);
+	if (ret)
+		goto fallback;
 	if (e1 != 0x10) {
-		ret = pci_write_config_byte(pch_f1, 0xE1, 0x10);
-		if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, false); return ret; }
-		msleep(1);
+		/* Clear the hide state while retaining the required control bits. */
+		ret = pci_bus_write_config_byte(bus, pch_f1, 0xE1, 0x10);
+		if (ret)
+			return -EIO;
+		usleep_range(1000, 2000);
 		e1_changed = true;
 	}
 
-	ret = pci_read_config_dword(pch_f1, 0x10, &bar0);
-	if (ret) { it87_hidden_cleanup(pch_f0, pch_f1, e1_changed); return ret; }
+	/* BAR0 supplies the base of the PCH private sideband register aperture. */
+	ret = pci_bus_read_config_dword(bus, pch_f1, 0x10, &bar0);
+	if (ret) {
+		ret = -EIO;
+		goto restore_e1;
+	}
 	if (!bar0 || bar0 == 0xFFFFFFFFu) {
-		/* BAR0 unavailable: apply Z390 fixed base fallback when requested */
 		if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
 			h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
 			h->hidden_ready = true;
-			it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-			return 0;
+			goto restore_e1;
 		}
-		it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-		return -EIO;
+		ret = -ENODEV;
+		goto restore_e1;
 	}
+	/* Add the generation-specific DMI PCR port and register-block offset. */
 	h->hidden_base = (bar0 & 0xFF000000u) + hidden_ofs;
 	h->hidden_ready = true;
-	it87_hidden_cleanup(pch_f0, pch_f1, e1_changed);
-	return 0;
+
+restore_e1:
+	/* Return P2SB to the exact visibility state observed on entry. */
+	if (e1_changed) {
+		if (pci_bus_write_config_byte(bus, pch_f1, 0xE1, e1)) {
+			h->hidden_base = 0;
+			h->hidden_ready = false;
+			return -EIO;
+		}
+		usleep_range(1000, 2000);
+	}
+	return ret;
+
+fallback:
+	/* Z390 firmware uses a fixed sideband aperture when BAR0 is unavailable. */
+	if (hidden_ofs == IT87_HIDDEN_OFS_Z390) {
+		h->hidden_base = IT87_HIDDEN_BASE_Z390_FALLBACK;
+		h->hidden_ready = true;
+		return 0;
+	}
+	return -ENODEV;
 }
 
 /* ----- Intel BIOS Data/Feature mask helpers ----- */
@@ -1613,6 +1621,7 @@ static int _save_regs(struct it87_h2ram_handle *h)
 		if (ret)
 			return ret;
 	} else if (v == IT87_H2_VENDOR_INTEL) {
+		/* Snapshot the public bridge decode registers before taking ownership. */
 		ret = pci_reg_read(h->bridge, 0xD8, &h->ord8);
 		if (ret)
 			return ret;
@@ -1621,6 +1630,7 @@ static int _save_regs(struct it87_h2ram_handle *h)
 			return ret;
 
 		if (h->hidden_ready && h->hidden_base) {
+			/* Snapshot the matching PCR copies for rollback and module unload. */
 			hb = ioremap(h->hidden_base, 0x200);
 			if (!hb)
 				return -ENOMEM;
@@ -1732,6 +1742,7 @@ rollback:
 static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 {
 	void __iomem *hb;
+	u32 verify;
 	int ret;
 
 	if (!h || !h->bridge)
@@ -1742,7 +1753,10 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 	if (h->current_base == h->base[idx])
 		return 0; /* already active */
 
-	/* Hidden-window mirror first if available */
+	/*
+	 * Program the private DMI PCR copies first.  Until these mirrors agree,
+	 * writes to the public bridge registers may not affect forwarded cycles.
+	 */
 	if (h->hidden_ready) {
 		hb = ioremap(h->hidden_base, 0x200);
 		if (!hb)
@@ -1750,12 +1764,17 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 
 		writel(h->r98[idx], hb + 0x40);
 		writel(h->rd8[idx], hb + 0x44);
-		/* Flush posted writes before programming the PCI mirror. */
-		(void)readl(hb + 0x44);
+		/* Read back both dwords, also flushing any posted MMIO writes. */
+		if (readl(hb + 0x40) != h->r98[idx] ||
+		    readl(hb + 0x44) != h->rd8[idx]) {
+			iounmap(hb);
+			ret = -EIO;
+			goto rollback;
+		}
 		iounmap(hb);
 	}
 
-	/* Then program PCI config */
+	/* Publish the same decode values through the visible ISA bridge. */
 	ret = pci_reg_write(h->bridge, 0xD8, h->rd8[idx]);
 	if (ret)
 		goto rollback;
@@ -1763,11 +1782,23 @@ static int _intel_enable_slot(struct it87_h2ram_handle *h, int idx)
 	ret = pci_reg_write(h->bridge, 0x98, h->r98[idx]);
 	if (ret)
 		goto rollback;
+	/* Confirm both public registers accepted the requested decode state. */
+	ret = pci_reg_read(h->bridge, 0xD8, &verify);
+	if (ret || verify != h->rd8[idx]) {
+		ret = ret ? ret : -EIO;
+		goto rollback;
+	}
+	ret = pci_reg_read(h->bridge, 0x98, &verify);
+	if (ret || verify != h->r98[idx]) {
+		ret = ret ? ret : -EIO;
+		goto rollback;
+	}
 
 	h->current_base = h->base[idx];
 	return 0;
 
 rollback:
+	/* Any partial update is unsafe, so restore all saved public and PCR state. */
 	_restore_regs(h);
 	return ret;
 }
@@ -1812,16 +1843,14 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 			h->is_amd   = (h->bridge->vendor == IT87_H2_VENDOR_AMD);
 			h->is_intel = (h->bridge->vendor == IT87_H2_VENDOR_INTEL);
 
-			/* For Intel, run the new detection scheme to set kind and, if
-	     * applicable (Skylake/Z390), compute and cache the hidden base
-	     * using it87_intel_init_hidden().
-	     */
+			/* Locate the matching DMI PCR mirror before saving bridge state. */
 			if (h->is_intel) {
 				int hret = it87_intel_init_hidden(h);
 				if (hret < 0) {
-					/* Ensure a clean generic state on failure */
-					h->hidden_ready = false;
-					h->hidden_base = 0;
+					pci_disable_device(h->bridge);
+					pci_dev_put(h->bridge);
+					h->bridge = NULL;
+					return hret;
 				}
 			}
 
@@ -1844,17 +1873,16 @@ static int it87_h2_init(struct it87_h2ram_handle *h)
 static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 {
 	u32 base32;
+	u16 mask;
 
 	if (!h || !h->bridge)return -ENODEV;
 	if (idx<0 || idx>1)return -EINVAL;
 	if (mmio_base==0)return -EINVAL;
 	if (mmio_base > 0xFFFFFFFFull)return -ERANGE;
 
+	/* The bridge window is encoded at 64 KiB granularity. */
 	base32 = (u32)mmio_base;
 	base32 &= ~0xFFFFu;                        /* 64KiB align down */
-
-	h->base[idx]  = base32;
-	h->have[idx]  = true;
 
 	/* If bridge is amd calculate the register values for the bridge window of idx */
 	if (h->bridge->vendor == IT87_H2_VENDOR_AMD) {
@@ -1869,11 +1897,27 @@ static int it87_h2_set_slot(struct it87_h2ram_handle *h, int idx, u64 mmio_base)
 		}
 	/* If bridge is intel calculate the register values for the bridge window of idx */
 	} else if (h->bridge->vendor == IT87_H2_VENDOR_INTEL) {
-			u16 mask = _intel_bios_mask_for_data_space(base32);
-			if (!mask) mask = _intel_bios_mask_for_feat_space(base32);
-			h->r98[idx] = ((base32 >> 16) << 16) | 1u;   /* Generic Memory Range */
-			h->rd8[idx] = h->ord8 & ~(u32)mask;        /* active-low: clear mask bits */
-		}
+		/*
+		 * The primary 2E/2F controller always uses decode bit 0.  The
+		 * secondary 4E/4F controller selects an active-low BIOS-range bit
+		 * from its physical address.
+		 */
+		mask = idx == 0 ? BIT(0) :
+			_intel_bios_mask_for_data_space(base32);
+		if (!mask && idx == 1)
+			mask = _intel_bios_mask_for_feat_space(base32);
+		if (!mask)
+			return -EINVAL;
+		/* Bit 0 enables the generic memory range; clearing D8 routes it. */
+		h->r98[idx] = base32 | 1u;
+		h->rd8[idx] = h->ord8 & ~(u32)mask;
+	} else {
+		return -ENODEV;
+	}
+
+	/* Commit the slot only after every vendor-specific value is valid. */
+	h->base[idx] = base32;
+	h->have[idx] = true;
 
 	return 0;
 }
@@ -7148,22 +7192,27 @@ static int __init sm_it87_init(void)
 			int         slot;
 			int         ret;
 
+			/* Acquire the ISA bridge and snapshot its decode state once. */
 			if (!it87_h2_global_inited) {
 				ret = it87_h2_global_init();
 				if (ret) {
-					pr_debug("H2RAM global bridge init failed: %d\n",
-			     ret);
+					pr_err("H2RAM global bridge init failed: %d\n",
+					       ret);
+					err = ret;
+					goto exit_unregister;
 				} else {
 					it87_h2_global_inited = true;
 				}
 			}
 			if (it87_h2_global_ready) {
-				/* slot 0 = 0x2E, slot 1 = 0x4E */
+				/* Register the controller's address as slot 0=2E or slot 1=4E. */
 				slot = (sioaddr[i]==REG_4E) ? 1 : 0;
 				ret = it87_h2_global_set_slot(slot, base);
 				if (ret) {
-					pr_debug("H2RAM set_slot(%d,%pa) failed: %d\n",
-			     slot, &base, ret);
+					pr_err("H2RAM set_slot(%d,%pa) failed: %d\n",
+					       slot, &base, ret);
+					err = ret;
+					goto exit_unregister;
 				}
 			}
 		}
