@@ -6527,6 +6527,8 @@ static int it87_probe(struct platform_device *pdev)
 	struct resource       *res_ecio;
 	struct device         *dev       = &pdev->dev;
 	struct it87_sio_data  *sio_data  = dev_get_platdata(dev);
+	struct gbw_mgid_info   mgid_info;
+	const char             *hwmon_name;
 	int                    enable_pwm_interface;
 	struct device         *hwmon_dev;
 	int                    err;
@@ -6534,6 +6536,14 @@ static int it87_probe(struct platform_device *pdev)
 	data = devm_kzalloc(dev, sizeof(struct it87_data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
+
+	hwmon_name = it87_devices[sio_data->type].name;
+	if (!gbw_read_siv_info(&mgid_info)) {
+		hwmon_name = devm_kasprintf(dev, GFP_KERNEL, "%s_%08x",
+					   hwmon_name, mgid_info.group);
+		if (!hwmon_name)
+			return -ENOMEM;
+	}
 
 	/*
      * Resource layout from it87_device_add():
@@ -6749,7 +6759,7 @@ static int it87_probe(struct platform_device *pdev)
 		return err;
 
 	hwmon_dev = devm_hwmon_device_register_with_groups(dev,
-			     it87_devices[sio_data->type].name,
+			     hwmon_name,
 			     data, data->groups);
 	return PTR_ERR_OR_ZERO(hwmon_dev);
 }
