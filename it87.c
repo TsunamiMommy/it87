@@ -1211,15 +1211,15 @@ static const struct dmi_system_id gigabyte_dmi_table[] = {
 	{ }
 };
 
-/* Parsed SIV/MGID description */
-struct gbw_mgid_info {
-	u32 group;        /* raw 32-bit MGID (low 32 bits) */
+/* Parsed SIV description */
+struct gbw_siv_info {
+	u32 siv;          /* raw 32-bit SIV (low 32 bits) */
 	u8  platform;     /* bits 31:28 */
 	u8  special;      /* bits 27:24 */
 	u8  fan_count;    /* bits 20:16 */
 	u8  temp_count;   /* bits 12:8  */
 	u8  volt_count;   /* bits 4:0   */
-	bool supported;   /* platform != 0 and group != 0 */
+	bool supported;   /* platform != 0 and siv != 0 */
 };
 
 static int gigabyte_smi_call(struct gigabyte_smi_regs *regs)
@@ -1291,37 +1291,37 @@ static int gbw_siv(u32 *siv)
 	return 0;
 }
 
-/* Parse low 32-bit MGID/SIV into fields */
-static int gbw_parse_mgid(u32 mgid, struct gbw_mgid_info *out)
+/* Parse low 32-bit SIV into fields */
+static int gbw_parse_siv(u32 siv, struct gbw_siv_info *out)
 {
 	if (!out)
 		return -EINVAL;
 
 	memset(out, 0, sizeof(*out));
-	out->group = mgid;
-	if (mgid == 0)
+	out->siv = siv;
+	if (siv == 0)
 		return -ENODEV;
 
-	out->platform = (mgid >> 28) & 0xF;
+	out->platform = (siv >> 28) & 0xF;
 	if (out->platform == 0)
 		return -ENODEV;
 
-	out->special    = (mgid >> 24) & 0xF;
-	out->fan_count  = (mgid >> 16) & 0x1F;
-	out->temp_count = (mgid >>  8) & 0x1F;
-	out->volt_count =  mgid        & 0x1F;
+	out->special    = (siv >> 24) & 0xF;
+	out->fan_count  = (siv >> 16) & 0x1F;
+	out->temp_count = (siv >>  8) & 0x1F;
+	out->volt_count =  siv         & 0x1F;
 	out->supported  = true;
 	return 0;
 }
 
 /* Read the cached SIV and parse it. */
-static int gbw_read_siv_info(struct gbw_mgid_info *out)
+static int gbw_read_siv_info(struct gbw_siv_info *out)
 {
-	u32 mgid;
-	int ret = gbw_siv(&mgid);
+	u32 siv;
+	int ret = gbw_siv(&siv);
 	if (ret)
 		return ret;
-	return gbw_parse_mgid(mgid, out);
+	return gbw_parse_siv(siv, out);
 }
 
 /*
@@ -1331,20 +1331,20 @@ static int gbw_read_siv_info(struct gbw_mgid_info *out)
  */
 static bool gigabyte_platform_valid(void)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 
 	return gigabyte_dmi_valid && !gbw_read_siv_info(&info) && info.supported;
 }
 
 /*
- * Gigabyte board-placement data explicitly marks the MGIDs below as having
+ * Gigabyte board-placement data explicitly marks the SIVs below as having
  * one "Noise Level" input routed through IT879x VIN3. Keep the AMD and Intel
- * sets separate because some numeric MGIDs occur in both vendor families.
+ * sets separate because some numeric SIVs occur in both vendor families.
  */
-static bool gigabyte_noise_mgid_supported(u32 mgid)
+static bool gigabyte_noise_siv_supported(u32 siv)
 {
 	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
-		switch (mgid) {
+		switch (siv) {
 		case 0x4308090b:
 		case 0x4208090b:
 		case 0x4108090b:
@@ -1381,7 +1381,7 @@ static bool gigabyte_noise_mgid_supported(u32 mgid)
 	}
 
 	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) {
-		switch (mgid) {
+		switch (siv) {
 		case 0x5008090a:
 		case 0x5108090a:
 		case 0x6108090a:
@@ -1425,14 +1425,14 @@ static bool gigabyte_noise_mgid_supported(u32 mgid)
 
 static bool it87_gigabyte_noise_supported(const struct it87_data *data)
 {
-	u32 mgid;
+	u32 siv;
 
 	/* Reject unsupported boards before any noise-specific Super I/O work. */
 	if (!gigabyte_dmi_valid || !gigabyte_siv_valid)
 		return false;
 
-	mgid = gigabyte_siv;
-	if (!gigabyte_noise_mgid_supported(mgid))
+	siv = gigabyte_siv;
+	if (!gigabyte_noise_siv_supported(siv))
 		return false;
 
 	/* IT8XXXFinder(Second) probes the secondary 0x4e/0x4f Super I/O. */
@@ -1503,10 +1503,10 @@ static int it87_restore_gigabyte_noise_input(struct it87_data *data)
 	return 0;
 }
 
-/* Convenience getters for individual SIV/MGID fields */
+/* Convenience getters for individual SIV fields */
 static int gbw_siv_platform_id(u8 *platform)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 	int ret = gbw_read_siv_info(&info);
 	if (ret)
 		return ret;
@@ -1516,7 +1516,7 @@ static int gbw_siv_platform_id(u8 *platform)
 
 static int gbw_siv_fan_count(u8 *count)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 	int ret = gbw_read_siv_info(&info);
 	if (ret)
 		return ret;
@@ -1527,7 +1527,7 @@ static int gbw_siv_fan_count(u8 *count)
 #ifdef IT87_FUTURE_USE
 static int gbw_siv_temp_count(u8 *count)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 	int ret = gbw_read_siv_info(&info);
 	if (ret)
 		return ret;
@@ -1539,7 +1539,7 @@ static int gbw_siv_temp_count(u8 *count)
 #ifdef IT87_FUTURE_USE
 static int gbw_siv_volt_count(u8 *count)
 {
-	struct gbw_mgid_info info;
+	struct gbw_siv_info info;
 	int ret = gbw_read_siv_info(&info);
 	if (ret)
 		return ret;
@@ -5010,7 +5010,7 @@ struct it87_noise_point {
 
 /*
  * Common Gigabyte noise calibration used by all actively supported AMD and
- * Intel MGIDs. The vendor utility performs nearest-neighbor lookup rather
+ * Intel SIVs. The vendor utility performs nearest-neighbor lookup rather
  * than interpolation.
  */
 static const struct it87_noise_point it87_gigabyte_noise_curve[] = {
@@ -6805,7 +6805,7 @@ static int it87_probe(struct platform_device *pdev)
 	struct resource       *res_ecio;
 	struct device         *dev       = &pdev->dev;
 	struct it87_sio_data  *sio_data  = dev_get_platdata(dev);
-	struct gbw_mgid_info   mgid_info;
+	struct gbw_siv_info    siv_info;
 	const char             *hwmon_name;
 	int                    enable_pwm_interface;
 	struct device         *hwmon_dev;
@@ -6816,9 +6816,9 @@ static int it87_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	hwmon_name = it87_devices[sio_data->type].name;
-	if (!gbw_read_siv_info(&mgid_info)) {
+	if (!gbw_read_siv_info(&siv_info)) {
 		hwmon_name = devm_kasprintf(dev, GFP_KERNEL, "%s_%08x",
-					   hwmon_name, mgid_info.group);
+					   hwmon_name, siv_info.siv);
 		if (!hwmon_name)
 			return -ENOMEM;
 	}
