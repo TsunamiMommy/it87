@@ -56,6 +56,13 @@ MOD_SUBDIR = drivers/hwmon
 MODDESTDIR=$(KERNEL_MODULES)/kernel/$(MOD_SUBDIR)
 
 obj-m = $(patsubst %,%.o,$(DRIVER))
+it87-y := it87-core.o gigabyte/gigabyte-smi.o \
+	 gigabyte/gigabyte-boards.o \
+	 gigabyte/smartfan/smartfan-h2ram.o \
+	 gigabyte/smartfan/smartfan-it86xx.o \
+	 gigabyte/smartfan/smartfan-h2ram-g2.o \
+	 gigabyte/smartfan/smartfan-h2ram-g3.o \
+	 gigabyte/smartfan/smartfan-it57xx.o
 obj-ko  := $(patsubst %,%.ko,$(DRIVER))
 
 MAKEFLAGS += --no-print-directory
@@ -103,7 +110,8 @@ dkms:
 	@cp ./dkms.conf $(DKMS_ROOT_PATH)
 	@cp ./Makefile $(DKMS_ROOT_PATH)
 	@cp ./compat.h $(DKMS_ROOT_PATH)
-	@cp ./it87.c $(DKMS_ROOT_PATH)
+	@cp ./it87-core.c $(DKMS_ROOT_PATH)
+	@cp -R ./gigabyte $(DKMS_ROOT_PATH)
 	@sed -i -e '/^PACKAGE_VERSION=/ s/=.*/=\"$(DRIVER_VERSION)\"/' $(DKMS_ROOT_PATH)/dkms.conf
 	@echo "$(DRIVER_VERSION)" >$(DKMS_ROOT_PATH)/VERSION
 	@dkms add -m $(DRIVER) -v $(DRIVER_VERSION)

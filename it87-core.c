@@ -82,6 +82,8 @@
 #include <linux/acpi.h>
 #include <linux/io.h>
 #include "compat.h"
+#include "gigabyte/gigabyte.h"
+#include "gigabyte/smartfan/smartfan.h"
 
 /* Defines fallbacks for processor models */
 #ifndef INTEL_SKYLAKE_L_MODEL
@@ -114,7 +116,6 @@ enum chips { it87, it8712, it8716, it8718, it8720, it8721, it8728, it8732,
 
 static struct platform_device *it87_pdev[2];
 
-#define GIGABYTE_SMI_PORT        0xB2
 #define GIGABYTE_SMI_CMD_SIV_ID  0xB364
 #define GIGABYTE_SMI_CMD_LED_ID  0xB464
 
@@ -436,48 +437,8 @@ static const u8 IT87_REG_TEMP_LOW_8686[] = {
 #define IT87_IT57XX_MAJOR     0xc00
 #define IT87_IT57XX_MINOR     0xc01
 
-#define IT87_H2RAM_BASE_FANS  3
-#define IT87_H2RAM_MAX_FANS   7
-#define IT87_H2RAM_MAX_EXTRA_VECTORS 9
-
-enum it87_h2ram_smartfan_gen {
-	IT87_H2RAM_SF_NONE = 0,
-	IT87_H2RAM_SF_G1,
-	IT87_H2RAM_SF_G2,
-	IT87_H2RAM_SF_G3,
-};
-
 /* H2RAM PWM feedback bytes for the three IT879x base channels. */
 static const u16 IT87_H2RAM_G23_PWM[] = { 0x911, 0x912, 0x913 };
-
-/* G3 tachometers are authoritative in H2RAM. */
-static const u16 IT87_H2RAM_G3_TACH_LSB[] = { 0x916, 0x918, 0x91a };
-static const u16 IT87_H2RAM_G3_TACH_MSB[] = { 0x917, 0x919, 0x91b };
-
-/* Primary-vector base addresses for the three IT879x base channels. */
-static const u16 IT87_H2RAM_G2_VECTOR[] = { 0x950, 0x960, 0x970 };
-static const u16 IT87_H2RAM_G3_VECTOR[] = { 0x950, 0x980, 0x9b0 };
-
-/*
- * IT57xx is an extension of IT879x G3, not a separate SmartFan controller.
- * Version 1.0 exposes two extra channels.  Version 2.0 exposes four, except
- * that AMD ECIO systems can access only the first two.
- */
-static const u16 IT87_IT57XX_VECTOR[] = { 0xc30, 0xc60, 0xc90, 0xcc0 };
-static const u16 IT87_IT57XX_V1_TACH_LSB[] = { 0xc0a, 0xc0c };
-static const u16 IT87_IT57XX_V1_TACH_MSB[] = { 0xc0b, 0xc0d };
-static const u16 IT87_IT57XX_V2_TACH_LSB[] = { 0xc10, 0xc12, 0xc14, 0xc16 };
-static const u16 IT87_IT57XX_V2_TACH_MSB[] = { 0xc11, 0xc13, 0xc15, 0xc17 };
-
-/*
- * IT8688 rev.2 / IT8689 extra-vector enable locations.
- * Vectors 1..3 use bit 7 in three separate bank-2 bytes.  Vectors 4..9
- * share bits 0..5 in one bank-3 byte.
- */
-#define IT87_EXTVEC_B2_ENABLE(nr, vec) \
-	(0x212 + (nr) * 0x10 + (vec) * 4)
-#define IT87_EXTVEC_B3_ENABLE(nr) \
-	(0x31c + (nr) * 0x10)
 
 static const u8 IT87_REG_AUTO_BASE[] = { 0x60, 0x68, 0x70, 0x78, 0xa0, 0xa8 };
 
@@ -1184,17 +1145,6 @@ struct it87_data {
 	u8 noise_pin_reg;
 };
 
-struct gigabyte_smi_regs {
-	u64 rax;
-	u64 rbx;
-	u64 rcx;
-	u64 rdx;
-	u64 rsi;
-	u64 rdi;
-};
-
-static DEFINE_MUTEX(gigabyte_smi_lock);
-
 static u64 gigabyte_siv;
 static u64 gigabyte_lid;
 static bool gigabyte_siv_valid;
@@ -1223,64 +1173,6 @@ struct gbw_siv_info {
 	u8  volt_count;   /* bits 4:0   */
 	bool supported;   /* platform != 0 and siv != 0 */
 };
-
-static int gigabyte_smi_call(struct gigabyte_smi_regs *regs)
-{
-	unsigned long flags;
-	u64 cmd;
-	u64 status;
-
-	if (!regs)
-		return -EINVAL;
-
-	cmd = regs->rax;
-
-	mutex_lock(&gigabyte_smi_lock);
-	preempt_disable();
-	local_irq_save(flags);
-
-	asm volatile(
-		"outb %%al, %%dx\n\t"
-		"outb %%al, $0xeb\n\t"
-		"outb %%al, $0xeb\n\t"
-		: "+a"(regs->rax), "+b"(regs->rbx), "+c"(regs->rcx),
-		  "+d"(regs->rdx), "+S"(regs->rsi), "+D"(regs->rdi)
-		:
-		: "memory"
-	);
-
-	local_irq_restore(flags);
-	preempt_enable();
-	status = regs->rax;
-	mutex_unlock(&gigabyte_smi_lock);
-
-	if (status != 0) {
-		pr_err("Gigabyte SMI call failed, cmd=0x%04llX status=0x%016llX\n",
-		       cmd & 0xffffULL, status);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int gigabyte_read_id(u16 cmd, u64 *id)
-{
-	struct gigabyte_smi_regs regs = {
-		.rax = cmd,
-		.rdx = GIGABYTE_SMI_PORT,
-	};
-	int ret;
-
-	if (!id)
-		return -EINVAL;
-
-	ret = gigabyte_smi_call(&regs);
-	if (ret)
-		return ret;
-
-	*id = regs.rbx;
-	return 0;
-}
 
 static int gbw_siv(u32 *siv)
 {
@@ -1336,93 +1228,6 @@ static bool gigabyte_platform_valid(void)
 	struct gbw_siv_info info;
 
 	return gigabyte_dmi_valid && !gbw_read_siv_info(&info) && info.supported;
-}
-
-/*
- * Gigabyte board-placement data explicitly marks the SIVs below as having
- * one "Noise Level" input routed through IT879x VIN3. Keep the AMD and Intel
- * sets separate because some numeric SIVs occur in both vendor families.
- */
-static bool gigabyte_noise_siv_supported(u32 siv)
-{
-	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
-		switch (siv) {
-		case 0x4308090b:
-		case 0x4208090b:
-		case 0x4108090b:
-		case 0x4008090a:
-		case 0x6108090b:
-		case 0x800a090a:
-		case 0x8108090a:
-		case 0x5108090b:
-		case 0x5208090b:
-		case 0x5308090a:
-		case 0x9a0a0908:
-		case 0x9a0b0908:
-		case 0x910a0909:
-		case 0x900a0909:
-		case 0x90090909:
-		case 0x90080909:
-		case 0xa00c090a:
-		case 0xa00c0908:
-		case 0xa00b090a:
-		case 0xa00a090a:
-		case 0xa10a090a:
-		case 0xa20a090a:
-		case 0xa00a0908:
-		case 0xa008090a:
-		case 0xa108090a:
-		case 0xa208090a:
-		case 0xa308090a:
-		case 0xa0080908:
-		case 0xa3080908:
-			return true;
-		default:
-			return false;
-		}
-	}
-
-	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) {
-		switch (siv) {
-		case 0x5008090a:
-		case 0x5108090a:
-		case 0x6108090a:
-		case 0x6208090b:
-		case 0x6508090b:
-		case 0x710a090a:
-		case 0x710a090b:
-		case 0x720a090b:
-		case 0x730a090b:
-		case 0x7108090b:
-		case 0x7208090b:
-		case 0x7308090b:
-		case 0x7106090b:
-		case 0x800a0909:
-		case 0x800a090a:
-		case 0x810a090a:
-		case 0x8008090a:
-		case 0x8108090a:
-		case 0x8008090b:
-		case 0x900a0909:
-		case 0x910a090a:
-		case 0x900a090a:
-		case 0x9108090a:
-		case 0x9008090a:
-		case 0x9008090b:
-		case 0xa00b090b:
-		case 0xa00a090b:
-		case 0xa10a090b:
-		case 0xa009090b:
-		case 0xa008090b:
-		case 0xa108090b:
-		case 0xa00a080b:
-			return true;
-		default:
-			return false;
-		}
-	}
-
-	return false;
 }
 
 static bool it87_gigabyte_noise_supported(const struct it87_data *data)
@@ -2834,11 +2639,8 @@ static void it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
 
 static int it87_h2ram_channel_count(const struct it87_data *data)
 {
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3)
-		return IT87_H2RAM_BASE_FANS + data->it57xx_fans;
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2)
-		return IT87_H2RAM_BASE_FANS;
-	return 0;
+	return gigabyte_smartfan_channel_count(data->h2ram_sf_gen,
+					     data->it57xx_fans);
 }
 
 static bool it87_is_it57xx_channel(const struct it87_data *data, int nr)
@@ -2862,42 +2664,17 @@ static bool it87_needs_extra_vector_disable(const struct it87_data *data)
 
 static u16 it87_h2ram_vector_base(const struct it87_data *data, int nr)
 {
-	if (it87_is_it57xx_channel(data, nr))
-		return IT87_IT57XX_VECTOR[nr - IT87_H2RAM_BASE_FANS];
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2)
-		return IT87_H2RAM_G2_VECTOR[nr];
-
-	return IT87_H2RAM_G3_VECTOR[nr];
+	return gigabyte_smartfan_vector_base(data->h2ram_sf_gen,
+					    data->it57xx_fans, nr);
 }
 
 static bool it87_h2ram_tach_regs(const struct it87_data *data, int nr,
 				 u16 *lsb, u16 *msb)
 {
-	int ext;
-
-	if (data->h2ram_sf_gen != IT87_H2RAM_SF_G3)
-		return false;
-
-	if (nr < IT87_H2RAM_BASE_FANS) {
-		*lsb = IT87_H2RAM_G3_TACH_LSB[nr];
-		*msb = IT87_H2RAM_G3_TACH_MSB[nr];
-		return true;
-	}
-
-	if (!it87_is_it57xx_channel(data, nr))
-		return false;
-
-	ext = nr - IT87_H2RAM_BASE_FANS;
-	if (data->it57xx_version == 1) {
-		*lsb = IT87_IT57XX_V1_TACH_LSB[ext];
-		*msb = IT87_IT57XX_V1_TACH_MSB[ext];
-	} else {
-		*lsb = IT87_IT57XX_V2_TACH_LSB[ext];
-		*msb = IT87_IT57XX_V2_TACH_MSB[ext];
-	}
-
-	return true;
+	return gigabyte_smartfan_tach_regs(data->h2ram_sf_gen,
+						 data->it57xx_version,
+						 data->it57xx_fans,
+						 nr, lsb, msb);
 }
 
 static bool it87_h2ram_tach_channel(const struct it87_data *data, int nr)
@@ -2909,63 +2686,46 @@ static bool it87_h2ram_tach_channel(const struct it87_data *data, int nr)
 
 static void it87_h2ram_set_smartfan(struct it87_data *data, bool enable)
 {
-	int cur = data->read(data, IT87_SMARTFAN_ENABLE);
-	u8 val;
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
 
-	if (cur < 0)
-		return;
-
-	val = (u8)cur;
-	if (enable)
-		val |= BIT(0);
-	else
-		val &= ~BIT(0);
-
-	if (val == (u8)cur)
-		return;
-
-	data->write(data, IT87_SMARTFAN_ENABLE, val);
+	gigabyte_smartfan_set_enable(&io, enable);
 }
 
 static u8 it87_h2ram_override_mask(const struct it87_data *data)
 {
-	int channels;
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1)
-		return data->pwm_override_mask & GENMASK(IT87_H2RAM_BASE_FANS - 1, 0);
-
-	channels = it87_h2ram_channel_count(data);
-	if (!channels)
-		return 0;
-
-	return data->pwm_override_mask & (BIT(channels) - 1);
+	return gigabyte_smartfan_override_mask(data->h2ram_sf_gen,
+					       data->it57xx_fans,
+					       data->pwm_override_mask);
 }
 
-/* Save the shared SmartFan byte only when software first takes ownership. */
 static void it87_h2ram_take_control(struct it87_data *data)
 {
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_NONE)
-		return;
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
 
-	if (!data->h2ram_smartfan_orig_valid) {
-		data->h2ram_smartfan_orig =
-			data->read(data, IT87_SMARTFAN_ENABLE);
-		data->h2ram_smartfan_orig_valid = true;
-	}
-
-	/* G1 hands control to the conventional EC; G2/G3 keep SmartFan active. */
-	it87_h2ram_set_smartfan(data, data->h2ram_sf_gen != IT87_H2RAM_SF_G1);
+	gigabyte_smartfan_claim(&io, data->h2ram_sf_gen,
+			       &data->h2ram_smartfan_orig,
+			       &data->h2ram_smartfan_orig_valid);
 }
 
 static void it87_h2ram_restore_global_snapshot(struct it87_data *data,
 						bool release)
 {
-	if (!data->h2ram_smartfan_orig_valid)
-		return;
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
 
-	data->write(data, IT87_SMARTFAN_ENABLE, data->h2ram_smartfan_orig);
-	if (release)
-		data->h2ram_smartfan_orig_valid = false;
+	gigabyte_smartfan_release(&io, data->h2ram_smartfan_orig,
+				 &data->h2ram_smartfan_orig_valid, release);
 }
 
 static void it87_h2ram_release_control_if_idle(struct it87_data *data)
@@ -3084,94 +2844,55 @@ static void it87_apply_conventional_override(struct it87_data *data, int nr,
 
 static void it87_h2ram_save_vector(struct it87_data *data, int nr)
 {
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
 	u16 base;
-	int i;
 
 	if (data->h2ram_vector_saved[nr])
 		return;
 
 	base = it87_h2ram_vector_base(data, nr);
-
-	data->h2ram_primary_saved[nr][0] = data->read(data, base + 2);
-	data->h2ram_primary_saved[nr][1] = data->read(data, base + 3);
-	data->h2ram_primary_saved[nr][2] = data->read(data, base + 4);
-	data->h2ram_primary_saved[nr][3] = data->read(data, base + 5);
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
-		data->h2ram_primary_saved[nr][4] = 0;
-		for (i = 0; i < 3; i++)
-			data->h2ram_extra_start_saved[nr][i] =
-				data->read(data, base + 6 + i * 2);
-	} else {
-		data->h2ram_primary_saved[nr][4] = data->read(data, base + 6);
-		for (i = 0; i < IT87_H2RAM_MAX_EXTRA_VECTORS; i++)
-			data->h2ram_extra_start_saved[nr][i] =
-				data->read(data, base + 7 + i * 4);
-	}
-
+	gigabyte_smartfan_save_vector(data->h2ram_sf_gen, &io, base,
+				     data->h2ram_primary_saved[nr],
+				     data->h2ram_extra_start_saved[nr]);
 	data->h2ram_vector_saved[nr] = true;
 }
 
 static void it87_h2ram_set_manual(struct it87_data *data, int nr, u8 pwm)
 {
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
 	u16 base = it87_h2ram_vector_base(data, nr);
-	int i;
 
 	it87_h2ram_save_vector(data, nr);
-
-	/* G2/G3 direct manual control is performed with SmartFan left on. */
 	it87_h2ram_set_smartfan(data, true);
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
-		/* Move the three extra vectors out of the usable temperature range. */
-		for (i = 0; i < 3; i++)
-			data->write(data, base + 6 + i * 2, 0x7f);
-
-		data->write(data, base + 2, 0x00); /* fan start temp */
-		data->write(data, base + 3, 0x7f); /* full-speed temp */
-		data->write(data, base + 4, pwm);  /* direct duty */
-		data->write(data, base + 5, 0x00); /* primary slope */
-	} else {
-		/* G3 explicitly disables an extra vector when Start Temp == 0x64. */
-		for (i = 0; i < IT87_H2RAM_MAX_EXTRA_VECTORS; i++)
-			data->write(data, base + 7 + i * 4, 0x64);
-
-		data->write(data, base + 2, 0x00); /* fan start temp */
-		data->write(data, base + 3, 0x7f); /* full-speed temp */
-		data->write(data, base + 4, pwm);  /* direct duty */
-		data->write(data, base + 5, 0x00); /* slope LSB */
-		data->write(data, base + 6, 0x00); /* slope MSB */
-	}
-
+	gigabyte_smartfan_set_manual(data->h2ram_sf_gen, &io, base, pwm);
 	data->pwm_duty[nr] = pwm;
 }
 
 static void it87_h2ram_restore_vector(struct it87_data *data, int nr,
 					       bool release)
 {
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
 	u16 base;
-	int i;
 
 	if (!data->h2ram_vector_saved[nr])
 		return;
 
 	base = it87_h2ram_vector_base(data, nr);
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G2) {
-		for (i = 0; i < 3; i++)
-			data->write(data, base + 6 + i * 2,
-				    data->h2ram_extra_start_saved[nr][i]);
-	} else {
-		for (i = 0; i < IT87_H2RAM_MAX_EXTRA_VECTORS; i++)
-			data->write(data, base + 7 + i * 4,
-				    data->h2ram_extra_start_saved[nr][i]);
-		data->write(data, base + 6, data->h2ram_primary_saved[nr][4]);
-	}
-
-	data->write(data, base + 5, data->h2ram_primary_saved[nr][3]);
-	data->write(data, base + 4, data->h2ram_primary_saved[nr][2]);
-	data->write(data, base + 3, data->h2ram_primary_saved[nr][1]);
-	data->write(data, base + 2, data->h2ram_primary_saved[nr][0]);
+	gigabyte_smartfan_restore_vector(data->h2ram_sf_gen, &io, base,
+					data->h2ram_primary_saved[nr],
+					data->h2ram_extra_start_saved[nr]);
 
 	if (release)
 		data->h2ram_vector_saved[nr] = false;
@@ -3179,45 +2900,32 @@ static void it87_h2ram_restore_vector(struct it87_data *data, int nr,
 
 static void it87_disable_extra_vectors(struct it87_data *data, int nr)
 {
-	u16 reg;
-	int i;
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
 
 	if (!it87_needs_extra_vector_disable(data))
 		return;
 
-	if (!data->extvec_enable_saved[nr]) {
-		for (i = 0; i < 3; i++)
-			data->extvec_saved[nr][i] = data->read(data,
-					IT87_EXTVEC_B2_ENABLE(nr, i));
-		data->extvec_saved[nr][3] =
-			data->read(data, IT87_EXTVEC_B3_ENABLE(nr));
-		data->extvec_enable_saved[nr] = true;
-	}
-
-	for (i = 0; i < 3; i++) {
-		reg = IT87_EXTVEC_B2_ENABLE(nr, i);
-		data->write(data, reg, data->read(data, reg) & ~BIT(7));
-	}
-
-	reg = IT87_EXTVEC_B3_ENABLE(nr);
-	data->write(data, reg, data->read(data, reg) & ~GENMASK(5, 0));
+	gigabyte_smartfan_extvec_disable(&io, nr,
+					&data->extvec_enable_saved[nr],
+					data->extvec_saved[nr]);
 }
 
 static void it87_restore_extra_vectors(struct it87_data *data, int nr,
 						bool release)
 {
-	int i;
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
 
-	if (!data->extvec_enable_saved[nr])
-		return;
-
-	for (i = 0; i < 3; i++)
-		data->write(data, IT87_EXTVEC_B2_ENABLE(nr, i),
-			    data->extvec_saved[nr][i]);
-	data->write(data, IT87_EXTVEC_B3_ENABLE(nr),
-		    data->extvec_saved[nr][3]);
-	if (release)
-		data->extvec_enable_saved[nr] = false;
+	gigabyte_smartfan_extvec_restore(&io, nr,
+					&data->extvec_enable_saved[nr],
+					data->extvec_saved[nr], release);
 }
 
 /* Put active software-owned channels back on their exact firmware snapshots. */
@@ -6515,18 +6223,15 @@ static void it87_detect_h2ram_smartfan(struct device *dev,
 	g23_major = data->read(data, IT87_H2RAM_G23_MAJOR);
 	g23_minor = data->read(data, IT87_H2RAM_G23_MINOR);
 
-	if (g23_major == 0x01 && g23_minor == 0x00 &&
-	    (data->type == it8792 || data->type == it87952)) {
-		data->h2ram_sf_gen = IT87_H2RAM_SF_G3;
-	} else if (g23_major == 0x00 &&
-		   (g23_minor == 0x01 || g23_minor == 0x03 ||
-		    g23_minor == 0x04) && data->type == it8792) {
-		data->h2ram_sf_gen = IT87_H2RAM_SF_G2;
-	} else {
+	data->h2ram_sf_gen = gigabyte_smartfan_detect_g23(
+		data->type == it8792 || data->type == it87952,
+		data->type == it8792, g23_major, g23_minor);
+	if (data->h2ram_sf_gen == IT87_H2RAM_SF_NONE) {
 		g1_major = data->read(data, IT87_H2RAM_G1_MAJOR);
 		g1_minor = data->read(data, IT87_H2RAM_G1_MINOR);
-		if (g1_major && g1_minor &&
-		    (data->type == it8790 || data->type == it8792))
+		if (gigabyte_smartfan_detect_g1(
+			    data->type == it8790 || data->type == it8792,
+			    g1_major, g1_minor))
 			data->h2ram_sf_gen = IT87_H2RAM_SF_G1;
 	}
 
@@ -6546,13 +6251,10 @@ static void it87_detect_h2ram_smartfan(struct device *dev,
 			it57_major = data->read(data, IT87_IT57XX_MAJOR);
 			it57_minor = data->read(data, IT87_IT57XX_MINOR);
 
-			if (it57_minor == 0x00 && it57_major == 0x01) {
-				data->it57xx_version = 1;
-				data->it57xx_fans = 2;
-			} else if (it57_minor == 0x00 && it57_major == 0x02) {
-				data->it57xx_version = 2;
-				data->it57xx_fans = data->ecio_h2ram ? 2 : 4;
-			}
+			gigabyte_smartfan_it57xx_detect(it57_major, it57_minor,
+						   data->ecio_h2ram,
+						   &data->it57xx_version,
+						   &data->it57xx_fans);
 		}
 	}
 
