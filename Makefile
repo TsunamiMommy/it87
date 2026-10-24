@@ -56,7 +56,8 @@ MOD_SUBDIR = drivers/hwmon
 MODDESTDIR=$(KERNEL_MODULES)/kernel/$(MOD_SUBDIR)
 
 obj-m = $(patsubst %,%.o,$(DRIVER))
-it87-y := it87-core.o gigabyte/bridge.o gigabyte/ecio.o gigabyte/gigabyte-smi.o \
+it87-y := it87-core.o gigabyte/bridge.o gigabyte/ecio.o \
+	 gigabyte/io.o gigabyte/gigabyte-smi.o \
 	 gigabyte/gigabyte-boards.o \
 	 gigabyte/smartfan/smartfan-h2ram.o \
 	 gigabyte/smartfan/smartfan-it86xx.o \

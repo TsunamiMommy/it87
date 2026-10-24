@@ -85,6 +85,8 @@
 #include "gigabyte/gigabyte.h"
 #include "gigabyte/bridge.h"
 #include "gigabyte/ecio.h"
+#include "gigabyte/io.h"
+#include "gigabyte/smfi.h"
 #include "gigabyte/smartfan/smartfan.h"
 
 #ifndef IT87_DRIVER_VERSION
@@ -109,23 +111,13 @@ static struct platform_device *it87_pdev[2];
 
 #define	DEV	  0x07	/* Register: Logical device select */
 #define	PME	  0x04	/* The device with the fan registers in it */
-#define H2RAM 0x0f   /* The device with the H2RAM registers in it */
 
 /* The device with the IT8718F/IT8720F VID value in it */
 #define	GPIO	0x07
 
-/* Hybrid window access definitions */
-#define H2RAM_LOW_BOUND 0x800   /* Lower boundary for H2RAM window */
-#define H2RAM_HI_BOUND  0xfff   /* Upper boundary for H2RAM window*/
-
 /* Normal MMIO window upper boundary */
 #define MMIO_HI_BOUND   0x3ff   /* Normal MMIO upper boundary */
 
-/* Logical device F (SMFI/H2RAM) registers (IT8790E, IT8792E, IT87952E) */
-#define IT87_SMFI_ENABLE	0x30  /* SMFI enable Register (H2RAM support) */
-#define IT87_SMFI_BASE_LOW  0xf5  /* SMFI address low address & feat support */
-#define IT87_SMFI_BASE_HI   0xf6  /* SMFI address high byte */
-#define IT87_SMFI_BASE_EX   0xfc  /* SMFI register for 24 bit SMFI addresses */
 
 
 
@@ -987,6 +979,7 @@ struct it87_data {
 	bool mmio_bridge;   /* ISA bridge MMIO without hybrid Access */
 	bool mmio_h2ram;    /* ISA bridge MMIO with hybrid access */
 	bool ecio_h2ram;    /* Extended ECIO ports with hybrid access. */
+	struct gigabyte_io gigabyte_io;
 
 	/* IT879x H2RAM SmartFan state. */
 	enum it87_h2ram_smartfan_gen h2ram_sf_gen;
@@ -1548,125 +1541,24 @@ static void it87_mmio_write(struct it87_data *data, u16 reg, u8 value)
 	writeb(value, data->mmio + reg);
 }
 
-/* Legacy IT8688 eSPI MMIO writes require the bank selector to match. */
-static void it87_espi_mmio_write(struct it87_data *data, u16 reg, u8 value)
+static int it87_gigabyte_legacy_read(void *private, u16 reg)
 {
-	u8 bank_reg;
-	u8 bank;
-	u8 current_bank;
-
-	if (reg == IT87_REG_BANK) {
-		it87_mmio_write(data, reg, value);
-		return;
-	}
-
-	bank = (reg >> 8) & 0x03;
-	bank_reg = it87_mmio_read(data, IT87_REG_BANK);
-	current_bank = (bank_reg >> 5) & 0x03;
-	if (current_bank != bank)
-		it87_mmio_write(data, IT87_REG_BANK,
-				  (bank_reg & ~0x60) | (bank << 5));
-
-	it87_mmio_write(data, reg, value);
-	if (current_bank != bank)
-		it87_mmio_write(data, IT87_REG_BANK, bank_reg);
+	return _it87_io_read(private, reg);
 }
 
-/* ISA bridge MMIO accessors */
-static int it87_bridge_read(struct it87_data *data, u16 reg)
+static void it87_gigabyte_legacy_write(void *private, u16 reg, u8 value)
 {
-	if (data->mmio &&
-		!(data->features & FEAT_MMIO) &&
-		(data->mmio_bridge || data->mmio_h2ram)) {
-		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
-		int val = 0;
-
-		mutex_lock(&gigabyte_bridge_mutex);
-
-		if (gigabyte_bridge_ready() &&
-		    !gigabyte_bridge_use_slot(slot))
-			val = it87_mmio_read(data, reg);
-
-		mutex_unlock(&gigabyte_bridge_mutex);
-		return val;
-	}
-	return 0;
+	_it87_io_write(private, reg, value);
 }
 
-static void it87_bridge_write(struct it87_data *data, u16 reg, u8 value)
+static int it87_gigabyte_read(struct it87_data *data, u16 reg)
 {
-	if (data->mmio &&
-		!(data->features & FEAT_MMIO) &&
-		(data->mmio_bridge || data->mmio_h2ram)) {
-		int slot = (data->sioaddr==REG_4E) ? 1 : 0;
-
-		mutex_lock(&gigabyte_bridge_mutex);
-
-		if (gigabyte_bridge_ready() &&
-		    !gigabyte_bridge_use_slot(slot)) {
-			if (data->type == it8688 && gigabyte_bridge_intel_espi())
-				it87_espi_mmio_write(data, reg, value);
-			else
-				it87_mmio_write(data, reg, value);
-		}
-
-		mutex_unlock(&gigabyte_bridge_mutex);
-	}
+	return gigabyte_io_read(&data->gigabyte_io, reg);
 }
 
-/* Hybrid H2RAM access:
- *   0x000–0x7FF : legacy EC I/O (banked)
- *   0x800–0xFFF : MMIO via H2RAM window
- */
-static int it87_h2ram_read(struct it87_data *data, u16 reg)
+static void it87_gigabyte_write(struct it87_data *data, u16 reg, u8 value)
 {
-	if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
-		/* High region: go through MMIO window */
-		if (has_h2ram_direct(data))
-			return it87_mmio_read(data, reg);
-		return it87_bridge_read(data, reg);
-	}
-	/* Low region: conventional EC I/O path */
-	return _it87_io_read(data, reg);
-}
-
-static void it87_h2ram_write(struct it87_data *data, u16 reg, u8 value)
-{
-	if (reg >= H2RAM_LOW_BOUND && reg <= H2RAM_HI_BOUND) {
-		/* High region: go through MMIO window */
-		if (has_h2ram_direct(data)) {
-			it87_mmio_write(data, reg, value);
-			return;
-		}
-		it87_bridge_write(data, reg, value);
-		return;
-	}
-	/* Low region: conventional EC I/O path */
-	_it87_io_write(data, reg, value);
-}
-
-/* ECIO + Conventional I/O path */
-static int it87_ecio_read(struct it87_data *data, u16 reg)
-{
-	/* High region: go through ECIO window if hybrid ECIO is active */
-	if(reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND && data->ecio_h2ram) {
-		return gigabyte_ecio_read(reg);
-	}
-
-	/* Low region (or no ECIO hybrid): conventional EC I/O path */
-	return _it87_io_read(data, reg);
-}
-
-static void it87_ecio_write(struct it87_data *data, u16 reg, u8 value)
-{
-	/* High region: go through ECIO window if hybrid ECIO is active */
-	if(reg>=H2RAM_LOW_BOUND && reg<=H2RAM_HI_BOUND && data->ecio_h2ram) {
-		gigabyte_ecio_write(reg, value);
-		return;
-	}
-
-	/* Low region (or no ECIO hybrid): conventional EC I/O path */
-	_it87_io_write(data, reg, value);
+	gigabyte_io_write(&data->gigabyte_io, reg, value);
 }
 
 static int it87_h2ram_channel_count(const struct it87_data *data)
@@ -4585,7 +4477,7 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 		u8 reg1;
 		u8 reg2;
 		/* Select H2RAM (SMFI) configuration space */
-		superio_select(sioaddr, H2RAM);
+		superio_select(sioaddr, GIGABYTE_SIO_H2RAM);
 		/* Read SMFI enable register */
 		enable = superio_inb(sioaddr, IT87_SMFI_ENABLE);
 		/* If SMFI is enabled Read MMIO base address */
@@ -5202,26 +5094,26 @@ static void it87_init_regs(struct platform_device *pdev)
 		data->REG_TEMP_HIGH = IT87_REG_TEMP_HIGH;
 		break;
 	}
-	/* Sets various read/write routines for MMIO/ECIO devices *
-	 * it87_bridge_read/write use ISA bridge access to MMIO   *
-	 * it87_h2ram_read/write uses MMIO and conventional I/O   *
-	 * port access in the same memory space                   *
-	 * it87_ecio_read/write uses ECIO (special ports) and     *
-	 * conventional I/O in the same memory space              */
-	if (data->mmio) {
-		if (data->mmio_bridge) {
-			data->read  = it87_bridge_read;
-			data->write = it87_bridge_write;
-		} else if (data->mmio_h2ram) {
-			data->read  = it87_h2ram_read;
-			data->write = it87_h2ram_write;
-		} else {
-		    data->read  = it87_mmio_read;
-		    data->write = it87_mmio_write;
-		}
-	} else if (data->ecio_h2ram) {
-		data->read  = it87_ecio_read;
-		data->write = it87_ecio_write;
+	if ((data->mmio && (data->mmio_bridge || data->mmio_h2ram)) ||
+	    data->ecio_h2ram) {
+		struct gigabyte_io *io = &data->gigabyte_io;
+
+		io->mmio = data->mmio;
+		io->private = data;
+		io->legacy_read = it87_gigabyte_legacy_read;
+		io->legacy_write = it87_gigabyte_legacy_write;
+		io->slot = data->sioaddr == REG_4E ? 1 : 0;
+		io->direct = has_h2ram_direct(data);
+		io->bridge_enabled = !has_mmio(data);
+		io->it8688 = data->type == it8688;
+		io->mode = data->mmio ?
+			   (data->mmio_bridge ? GIGABYTE_IO_BRIDGE :
+			    GIGABYTE_IO_H2RAM) : GIGABYTE_IO_ECIO;
+		data->read = it87_gigabyte_read;
+		data->write = it87_gigabyte_write;
+	} else if (data->mmio) {
+		data->read = it87_mmio_read;
+		data->write = it87_mmio_write;
 	} else if (has_bank_sel(data)) {
 		data->read = it87_io_read;
 		data->write = it87_io_write;
@@ -6047,7 +5939,7 @@ static int __init it87_device_add(int index, unsigned short sio_address,
 		if (sio_data->mmio_h2ram)
 		{
 			start = mmio_address;
-			end   = mmio_address + H2RAM_HI_BOUND;
+			end   = mmio_address + GIGABYTE_H2RAM_LIMIT;
 		}
 
 		res[nres].name  = DRVNAME;
