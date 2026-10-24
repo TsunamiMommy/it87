@@ -86,6 +86,7 @@
 #include "gigabyte/bridge.h"
 #include "gigabyte/ecio.h"
 #include "gigabyte/io.h"
+#include "gigabyte/platform.h"
 #include "gigabyte/smfi.h"
 #include "gigabyte/smartfan/smartfan.h"
 
@@ -1106,16 +1107,7 @@ static const struct dmi_system_id gigabyte_dmi_table[] = {
 	{ }
 };
 
-/* Parsed SIV description */
-struct gbw_siv_info {
-	u32 siv;          /* raw 32-bit SIV (low 32 bits) */
-	u8  platform;     /* bits 31:28 */
-	u8  special;      /* bits 27:24 */
-	u8  fan_count;    /* bits 20:16 */
-	u8  temp_count;   /* bits 12:8  */
-	u8  volt_count;   /* bits 4:0   */
-	bool supported;   /* platform != 0 and siv != 0 */
-};
+/* The decoded Gigabyte firmware identity is shared with its backends. */
 
 static int gbw_siv(u32 *siv)
 {
@@ -1128,29 +1120,6 @@ static int gbw_siv(u32 *siv)
 	return 0;
 }
 
-/* Parse low 32-bit SIV into fields */
-static int gbw_parse_siv(u32 siv, struct gbw_siv_info *out)
-{
-	if (!out)
-		return -EINVAL;
-
-	memset(out, 0, sizeof(*out));
-	out->siv = siv;
-	if (siv == 0)
-		return -ENODEV;
-
-	out->platform = (siv >> 28) & 0xF;
-	if (out->platform == 0)
-		return -ENODEV;
-
-	out->special    = (siv >> 24) & 0xF;
-	out->fan_count  = (siv >> 16) & 0x1F;
-	out->temp_count = (siv >>  8) & 0x1F;
-	out->volt_count =  siv         & 0x1F;
-	out->supported  = true;
-	return 0;
-}
-
 /* Read the cached SIV and parse it. */
 static int gbw_read_siv_info(struct gbw_siv_info *out)
 {
@@ -1158,7 +1127,7 @@ static int gbw_read_siv_info(struct gbw_siv_info *out)
 	int ret = gbw_siv(&siv);
 	if (ret)
 		return ret;
-	return gbw_parse_siv(siv, out);
+	return gigabyte_platform_parse_siv(siv, out);
 }
 
 /*
@@ -4470,43 +4439,17 @@ static int __init it87_find(int sioaddr, unsigned short *address,
 			}
 		}
 	}
-	/* H2RAM MMIO/ECIO is a Gigabyte-specific firmware interface. */
+	/* The Gigabyte backend owns SMFI address decoding and ECIO fallback. */
 	if (has_h2ram_mmio(config) && mmio && gigabyte_ok) {
-		u8 enable;
-		u8 reg;
-		u8 reg1;
-		u8 reg2;
-		/* Select H2RAM (SMFI) configuration space */
-		superio_select(sioaddr, GIGABYTE_SIO_H2RAM);
-		/* Read SMFI enable register */
-		enable = superio_inb(sioaddr, IT87_SMFI_ENABLE);
-		/* If SMFI is enabled Read MMIO base address */
-		if (enable) {
-			reg  = superio_inb(sioaddr, IT87_SMFI_BASE_LOW);
-			reg1 = superio_inb(sioaddr, IT87_SMFI_BASE_HI);
-			/* If IT87952 compose 24 bit address */
-			if (has_h2ram_ex_addr(config)) {
-				reg2  = superio_inb(sioaddr, IT87_SMFI_BASE_EX);
-				base  = 0xFC000000;
-				base |= (u32)reg1 << 16;           /* F6 full       */
-				base |= (u32)(reg & 0xF0) << 12;   /* F5 high nib   */
-				base |= (u32)(reg2 & 0x0F) << 24;
-			}
-			/* If not IT87952 compose 16 bit address */
-			else {
-				base  = 0xFF000000;
-				base |= (u32)reg1 << 16;           /* F6 full       */
-				base |= (u32)(reg & 0xF0) << 12;
-			}
-			sio_data->mmio_h2ram = 1;
-		}
-		/* If SMFI is disabled check if has ECIO and on AMD, if so, then enable ECIO */
-		else if ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) && has_h2ram_ecio(config)) {
-			pr_info("AMD platform with ECIO H2RAM detected, enabling ECIO backend\n");
-			sio_data->ecio_h2ram = 1;
-		}
+		bool mapped = false;
+		bool ecio = false;
 
-		superio_select(sioaddr, PME);
+		gigabyte_smfi_probe(sioaddr, has_h2ram_ex_addr(config),
+				    has_h2ram_ecio(config),
+				    boot_cpu_data.x86_vendor == X86_VENDOR_AMD,
+				    &base, &mapped, &ecio);
+		sio_data->mmio_h2ram = mapped;
+		sio_data->ecio_h2ram = ecio;
 	}
 
 	*mmio_address = base;
