@@ -6,8 +6,6 @@
 #include <linux/types.h>
 
 extern struct mutex gigabyte_bridge_mutex;
-
-int gigabyte_bridge_platform_id(u8 *platform);
 bool gigabyte_bridge_ready(void);
 bool gigabyte_bridge_initialized(void);
 bool gigabyte_bridge_intel_espi(void);

@@ -104,9 +104,6 @@ enum chips { it87, it8712, it8716, it8718, it8720, it8721, it8728, it8732,
 
 static struct platform_device *it87_pdev[2];
 
-#define GIGABYTE_SMI_CMD_SIV_ID  0xB364
-#define GIGABYTE_SMI_CMD_LED_ID  0xB464
-
 #define	REG_2E	0x2e	/* The register to read/write */
 #define	REG_4E	0x4e	/* Secondary register to read/write */
 
@@ -367,18 +364,6 @@ static const u8 IT87_REG_TEMP_LOW_8686[] = {
 #define IT87_REG_BEEP_ENABLE  0x5c
 
 #define IT87_REG_CHIPID       0x58
-/* SmartFan enable byte shared by IT879x G3 and its IT57xx extensions. */
-#define IT87_SMARTFAN_ENABLE  0x947
-
-/* IT879x H2RAM SmartFan version bytes. */
-#define IT87_H2RAM_G23_MAJOR  0x900
-#define IT87_H2RAM_G23_MINOR  0x901
-#define IT87_H2RAM_G1_MAJOR   0xa00
-#define IT87_H2RAM_G1_MINOR   0xa01
-
-/* IT57xx extension version bytes.  IT57xx exists only with IT879x G3. */
-#define IT87_IT57XX_MAJOR     0xc00
-#define IT87_IT57XX_MINOR     0xc01
 
 /* H2RAM PWM feedback bytes for the three IT879x base channels. */
 static const u16 IT87_H2RAM_G23_PWM[] = { 0x911, 0x912, 0x913 };
@@ -1089,68 +1074,15 @@ struct it87_data {
 	u8 noise_pin_reg;
 };
 
-static u64 gigabyte_siv;
-static u64 gigabyte_lid;
-static bool gigabyte_siv_valid;
-static bool gigabyte_lid_valid;
-static bool gigabyte_dmi_valid;
-static struct class *gigabyte_class;
-static struct device *gigabyte_dev;
-
-static const struct dmi_system_id gigabyte_dmi_table[] = {
-	{
-		.matches = {
-			DMI_MATCH(DMI_BOARD_VENDOR,
-				  "Gigabyte Technology Co., Ltd."),
-		},
-	},
-	{ }
-};
-
-/* The decoded Gigabyte firmware identity is shared with its backends. */
-
-static int gbw_siv(u32 *siv)
-{
-	if (!siv)
-		return -EINVAL;
-	if (!gigabyte_siv_valid)
-		return -ENODEV;
-
-	*siv = (u32)gigabyte_siv;
-	return 0;
-}
-
-/* Read the cached SIV and parse it. */
-static int gbw_read_siv_info(struct gbw_siv_info *out)
-{
-	u32 siv;
-	int ret = gbw_siv(&siv);
-	if (ret)
-		return ret;
-	return gigabyte_platform_parse_siv(siv, out);
-}
-
-/*
- * All Gigabyte-specific MMIO bridge, H2RAM and firmware-control workarounds
- * require both a Gigabyte DMI match and a successfully read, parseable SIV.
- * Native IT87 MMIO support is intentionally not covered by this predicate.
- */
-static bool gigabyte_platform_valid(void)
-{
-	struct gbw_siv_info info;
-
-	return gigabyte_dmi_valid && !gbw_read_siv_info(&info) && info.supported;
-}
-
 static bool it87_gigabyte_noise_supported(const struct it87_data *data)
 {
 	u32 siv;
 
 	/* Reject unsupported boards before any noise-specific Super I/O work. */
-	if (!gigabyte_dmi_valid || !gigabyte_siv_valid)
+	if (!gigabyte_platform_has_siv() ||
+	    gigabyte_platform_get_siv(&siv))
 		return false;
 
-	siv = (u32)gigabyte_siv;
 	if (!gigabyte_noise_siv_supported(siv))
 		return false;
 
@@ -1220,52 +1152,6 @@ static int it87_restore_gigabyte_noise_input(struct it87_data *data)
 	data->noise_pin_saved = false;
 	return 0;
 }
-
-/* Convenience getters for individual SIV fields */
-int gigabyte_bridge_platform_id(u8 *platform)
-{
-	struct gbw_siv_info info;
-	int ret = gbw_read_siv_info(&info);
-	if (ret)
-		return ret;
-	*platform = info.platform;
-	return 0;
-}
-
-static int gbw_siv_fan_count(u8 *count)
-{
-	struct gbw_siv_info info;
-	int ret = gbw_read_siv_info(&info);
-	if (ret)
-		return ret;
-	*count = info.fan_count;
-	return 0;
-}
-
-#ifdef IT87_FUTURE_USE
-static int gbw_siv_temp_count(u8 *count)
-{
-	struct gbw_siv_info info;
-	int ret = gbw_read_siv_info(&info);
-	if (ret)
-		return ret;
-	*count = info.temp_count;
-	return 0;
-}
-#endif
-
-#ifdef IT87_FUTURE_USE
-static int gbw_siv_volt_count(u8 *count)
-{
-	struct gbw_siv_info info;
-	int ret = gbw_read_siv_info(&info);
-	if (ret)
-		return ret;
-	*count = info.volt_count;
-	return 0;
-}
-#endif
-/* End of Gigabyte SIV/LID retrieval routines */
 
 /* Board specific settings from DMI matching */
 struct it87_dmi_data {
@@ -3554,108 +3440,6 @@ static SENSOR_DEVICE_ATTR(in8_label, S_IRUGO, show_label, NULL, 2);
 /* AVCC3 */
 static SENSOR_DEVICE_ATTR(in9_label, S_IRUGO, show_label, NULL, 3);
 
-static ssize_t gigabyte_siv_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	if (!gigabyte_siv_valid)
-		return sprintf(buf, "unavailable\n");
-
-	return sprintf(buf, "%08llX\n", (unsigned long long)gigabyte_siv);
-}
-
-static ssize_t gigabyte_lid_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	if (!gigabyte_lid_valid)
-		return sprintf(buf, "unavailable\n");
-
-	return sprintf(buf, "%08llX\n", (unsigned long long)gigabyte_lid);
-}
-
-static DEVICE_ATTR_RO(gigabyte_siv);
-static DEVICE_ATTR_RO(gigabyte_lid);
-
-static struct attribute *gigabyte_id_attributes[] = {
-	&dev_attr_gigabyte_siv.attr,
-	&dev_attr_gigabyte_lid.attr,
-	NULL
-};
-
-static const struct attribute_group gigabyte_id_group = {
-	.attrs = gigabyte_id_attributes,
-};
-
-static int __init gigabyte_ids_init(void)
-{
-	int ret;
-
-	gigabyte_dmi_valid = dmi_check_system(gigabyte_dmi_table);
-	if (!gigabyte_dmi_valid)
-		return 0;
-
-	gigabyte_siv_valid = !gigabyte_read_id(GIGABYTE_SMI_CMD_SIV_ID,
-						       &gigabyte_siv);
-	gigabyte_lid_valid = !gigabyte_read_id(GIGABYTE_SMI_CMD_LED_ID,
-						       &gigabyte_lid);
-
-	if (gigabyte_siv_valid)
-		pr_info("Gigabyte SIV ID = %08llX\n",
-			(unsigned long long)gigabyte_siv);
-	else
-		pr_warn("Failed to read Gigabyte SIV ID\n");
-
-	if (gigabyte_lid_valid)
-		pr_info("Gigabyte LID ID = %08llX\n",
-			(unsigned long long)gigabyte_lid);
-	else
-		pr_warn("Failed to read Gigabyte LID ID\n");
-
-	gigabyte_class = class_create("gigabyte");
-	if (IS_ERR(gigabyte_class)) {
-		ret = PTR_ERR(gigabyte_class);
-		gigabyte_class = NULL;
-		return ret;
-	}
-
-	gigabyte_dev = device_create(gigabyte_class, NULL, MKDEV(0, 0), NULL,
-				      "id");
-	if (IS_ERR(gigabyte_dev)) {
-		ret = PTR_ERR(gigabyte_dev);
-		gigabyte_dev = NULL;
-		class_destroy(gigabyte_class);
-		gigabyte_class = NULL;
-		return ret;
-	}
-
-	ret = sysfs_create_group(&gigabyte_dev->kobj, &gigabyte_id_group);
-	if (ret) {
-		device_unregister(gigabyte_dev);
-		gigabyte_dev = NULL;
-		class_destroy(gigabyte_class);
-		gigabyte_class = NULL;
-	}
-
-	return ret;
-}
-
-static void gigabyte_ids_exit(void)
-{
-	if (gigabyte_dev) {
-		sysfs_remove_group(&gigabyte_dev->kobj, &gigabyte_id_group);
-		device_unregister(gigabyte_dev);
-		gigabyte_dev = NULL;
-	}
-
-	if (gigabyte_class) {
-		class_destroy(gigabyte_class);
-		gigabyte_class = NULL;
-	}
-
-	gigabyte_siv_valid = false;
-	gigabyte_lid_valid = false;
-	gigabyte_dmi_valid = false;
-}
-
 struct it87_noise_point {
 	u16 mv;
 	u8 db;
@@ -5069,117 +4853,39 @@ static void it87_init_regs(struct platform_device *pdev)
 static void it87_detect_h2ram_smartfan(struct device *dev,
 				       struct it87_data *data)
 {
-	const char *h2ram_transport;
-	u8 g23_major, g23_minor;
-	u8 g1_major = 0, g1_minor = 0;
-	u8 it57_major = 0, it57_minor = 0;
-	u8 version_major, version_minor, smartfan;
-	bool siv_valid = false;
+	struct gigabyte_smartfan_io io = {
+		.data = data,
+		.read = data->read,
+		.write = data->write,
+	};
+	struct gigabyte_smartfan_probe_result result = { };
 	int i, channels;
 
-	if (!gigabyte_platform_valid())
-		return;
-
-	if (!data->mmio_h2ram && !data->ecio_h2ram)
+	if (!gigabyte_platform_valid() ||
+	    (!data->mmio_h2ram && !data->ecio_h2ram))
 		return;
 
 	if (data->type != it8790 && data->type != it8792 &&
 	    data->type != it87952)
 		return;
 
-	g23_major = data->read(data, IT87_H2RAM_G23_MAJOR);
-	g23_minor = data->read(data, IT87_H2RAM_G23_MINOR);
-
-	data->h2ram_sf_gen = gigabyte_smartfan_detect_g23(
-		data->type == it8792 || data->type == it87952,
-		data->type == it8792, g23_major, g23_minor);
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_NONE) {
-		g1_major = data->read(data, IT87_H2RAM_G1_MAJOR);
-		g1_minor = data->read(data, IT87_H2RAM_G1_MINOR);
-		if (gigabyte_smartfan_detect_g1(
-			    data->type == it8790 || data->type == it8792,
-			    g1_major, g1_minor))
-			data->h2ram_sf_gen = IT87_H2RAM_SF_G1;
-	}
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_NONE)
+	gigabyte_smartfan_probe(dev, &io, it87_devices[data->type].name,
+				data->revision, data->ecio_h2ram,
+				data->type == it8790 || data->type == it8792,
+				data->type == it8792,
+				data->type == it8792 || data->type == it87952,
+				&result);
+	if (result.gen == IT87_H2RAM_SF_NONE)
 		return;
 
-	/*
-	 * IT57xx is only valid as an extension of IT879x G3.  Require both
-	 * the extension version signature and Gigabyte SIV fan_count > 8.
-	 * There is no separate IT57xx SmartFan enable byte: 0x947 controls
-	 * the complete G3 controller, including all IT57xx channels.
-	 */
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3 &&
-	    !gbw_siv_fan_count(&data->siv_fan_count)) {
-		siv_valid = true;
-		if (data->siv_fan_count > 8) {
-			it57_major = data->read(data, IT87_IT57XX_MAJOR);
-			it57_minor = data->read(data, IT87_IT57XX_MINOR);
-
-			gigabyte_smartfan_it57xx_detect(it57_major, it57_minor,
-						   data->ecio_h2ram,
-						   &data->it57xx_version,
-						   &data->it57xx_fans);
-		}
-	}
-
-	smartfan = data->read(data, IT87_SMARTFAN_ENABLE);
+	data->h2ram_sf_gen = result.gen;
+	data->siv_fan_count = result.siv_fan_count;
+	data->it57xx_version = result.it57xx_version;
+	data->it57xx_fans = result.it57xx_fans;
 
 	channels = it87_h2ram_channel_count(data);
-	if (channels) {
-		for (i = 0; i < channels; i++)
-			data->h2ram_pwm_mode[i] = (smartfan & 0x01) ? 2 : 1;
-	}
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G1) {
-		version_major = g1_major;
-		version_minor = g1_minor;
-	} else {
-		version_major = g23_major;
-		version_minor = g23_minor;
-	}
-
-	/*
-	 * H2RAM backends use conventional EC I/O below 0x800.
-	 * The high H2RAM range uses bridge MMIO, direct MMIO, or ECIO.
-	 */
-	h2ram_transport = data->ecio_h2ram ? "ECIO" : "MMIO";
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3 && siv_valid)
-		dev_info(dev,
-			 "H2RAM SmartFan: %s rev %02x, G%u v%02x.%02x, access=EC, H2RAM=%s, SmartFan=0x%02x, channels=%d, SIV fan count=%u\n",
-			 it87_devices[data->type].name, data->revision,
-			 data->h2ram_sf_gen, version_major, version_minor,
-			 h2ram_transport, smartfan, channels,
-			 data->siv_fan_count);
-	else if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3)
-		dev_info(dev,
-			 "H2RAM SmartFan: %s rev %02x, G%u v%02x.%02x, access=EC, H2RAM=%s, SmartFan=0x%02x, channels=%d, SIV fan count=unavailable\n",
-			 it87_devices[data->type].name, data->revision,
-			 data->h2ram_sf_gen, version_major, version_minor,
-			 h2ram_transport, smartfan, channels);
-	else
-		dev_info(dev,
-			 "H2RAM SmartFan: %s rev %02x, G%u v%02x.%02x, access=EC, H2RAM=%s, SmartFan=0x%02x, channels=%d\n",
-			 it87_devices[data->type].name, data->revision,
-			 data->h2ram_sf_gen, version_major, version_minor,
-			 h2ram_transport, smartfan, channels);
-
-	if (data->h2ram_sf_gen == IT87_H2RAM_SF_G3 && siv_valid &&
-	    data->siv_fan_count > 8) {
-		if (data->it57xx_fans)
-			dev_info(dev,
-				 "IT57xx extension: v%02x.%02x, %u usable channels%s\n",
-				 it57_major, it57_minor, data->it57xx_fans,
-				 data->ecio_h2ram && data->it57xx_version == 2 ?
-				 " (ECIO limit)" : "");
-		else
-			dev_info(dev,
-				 "IT57xx extension: unrecognized v%02x.%02x (SIV fan count %u)\n",
-				 it57_major, it57_minor, data->siv_fan_count);
-	}
+	for (i = 0; i < channels; i++)
+		data->h2ram_pwm_mode[i] = result.pwm_mode;
 }
 
 /*
@@ -5447,7 +5153,7 @@ static int it87_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	hwmon_name = it87_devices[sio_data->type].name;
-	if (!gbw_read_siv_info(&siv_info)) {
+	if (!gigabyte_platform_read_siv_info(&siv_info)) {
 		hwmon_name = devm_kasprintf(dev, GFP_KERNEL, "%s_%08x",
 					   hwmon_name, siv_info.siv);
 		if (!hwmon_name)
@@ -6104,13 +5810,13 @@ static int __init sm_it87_init(void)
 	int                 i, err;
 
 	pr_info("it87 driver version %s\n", IT87_DRIVER_VERSION);
-	err = gigabyte_ids_init();
+	err = gigabyte_platform_init();
 	if (err)
 		return err;
 
 	err = platform_driver_register(&it87_driver);
 	if (err) {
-		gigabyte_ids_exit();
+		gigabyte_platform_exit();
 		return err;
 	}
 
@@ -6193,7 +5899,7 @@ exit_unregister:
 
 	gigabyte_bridge_release();
 	platform_driver_unregister(&it87_driver);
-	gigabyte_ids_exit();
+	gigabyte_platform_exit();
 	return err;
 }
 
@@ -6209,7 +5915,7 @@ static void __exit sm_it87_exit(void) {
 
 	gigabyte_bridge_release();
 	platform_driver_unregister(&it87_driver);
-	gigabyte_ids_exit();
+	gigabyte_platform_exit();
 }
 
 MODULE_AUTHOR("Chris Gauthron, Jean Delvare <jdelvare@suse.de>, Frank Crawford");

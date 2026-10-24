@@ -13,6 +13,7 @@
 #include <asm/intel-family.h>
 
 #include "bridge.h"
+#include "platform.h"
 
 /* Defines fallbacks for processor models */
 #ifndef INTEL_SKYLAKE_L_MODEL
@@ -160,7 +161,7 @@ static int it87_intel_init_hidden(struct it87_h2ram_handle *h)
 	 * 4 and 6 use the newer DMI port; earlier client generations use the
 	 * Skylake-family DMI port.  Other Intel bridges need no PCR mirror.
 	 */
-	siv_ret = gigabyte_bridge_platform_id(&platform);
+	siv_ret = gigabyte_platform_id(&platform);
 	if (siv_ret == 0 && (platform == 4 || platform == 6)) {
 		h->intel_isabridge_type = IT87_ISA_INTEL_Z390;
 		hidden_ofs = IT87_HIDDEN_OFS_Z390;

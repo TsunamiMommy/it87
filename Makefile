@@ -63,7 +63,8 @@ it87-y := it87-core.o gigabyte/bridge.o gigabyte/ecio.o \
 	 gigabyte/smartfan/smartfan-it86xx.o \
 	 gigabyte/smartfan/smartfan-h2ram-g2.o \
 	 gigabyte/smartfan/smartfan-h2ram-g3.o \
-	 gigabyte/smartfan/smartfan-it57xx.o
+	 gigabyte/smartfan/smartfan-it57xx.o \
+	 gigabyte/smartfan/smartfan-detect.o
 obj-ko  := $(patsubst %,%.ko,$(DRIVER))
 
 MAKEFLAGS += --no-print-directory

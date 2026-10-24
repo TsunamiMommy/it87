@@ -18,6 +18,7 @@ enum it87_h2ram_smartfan_gen {
 };
 
 struct it87_data;
+struct device;
 
 struct gigabyte_smartfan_io {
 	struct it87_data *data;
@@ -64,6 +65,20 @@ void gigabyte_smartfan_extvec_restore(const struct gigabyte_smartfan_io *io,
 				      const u8 snapshot[4], bool release);
 void gigabyte_smartfan_it57xx_detect(u8 major, u8 minor, bool ecio,
 				     u8 *version, u8 *count);
+
+struct gigabyte_smartfan_probe_result {
+	enum it87_h2ram_smartfan_gen gen;
+	u8 siv_fan_count;
+	u8 it57xx_version;
+	u8 it57xx_fans;
+	u8 pwm_mode;
+};
+
+void gigabyte_smartfan_probe(struct device *dev,
+			     const struct gigabyte_smartfan_io *io,
+			     const char *chip, u8 revision, bool ecio,
+			     bool allow_g1, bool allow_g2, bool allow_g3,
+			     struct gigabyte_smartfan_probe_result *result);
 
 u16 gigabyte_smartfan_g2_base(int fan);
 void gigabyte_smartfan_g2_save(const struct gigabyte_smartfan_io *io,
